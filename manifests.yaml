@@ -1,0 +1,289 @@
+# =============================================================================
+# OpenShift manifests — Onboarding Portal (air-gapped)
+# =============================================================================
+# Deploys the SAME two images used by docker-compose, driven by OpenShift objects.
+#
+# BEFORE APPLYING, replace the placeholders (search for ">>> REPLACE"):
+#   __NAMESPACE__    your project name           (e.g. onboarding)
+#   __APPS_DOMAIN__  the cluster apps domain      (e.g. apps.ocp.mycorp.local)
+#   __TAG__          the image tag you pushed     (e.g. 1.0)
+#
+# Quick replace (Linux admin box):
+#   sed -i 's/__NAMESPACE__/onboarding/g; s/__APPS_DOMAIN__/apps.ocp.mycorp.local/g; s/__TAG__/1.0/g' manifests.yaml
+#
+# Notes baked into this file (verified locally against the images):
+#   * Backend runs under OpenShift's random UID + GID 0; it only writes to the
+#     three mounted volumes (data/uploads/logs), which fsGroup makes writable.
+#   * Backend MUST stay at replicas: 1 (SQLite single-writer + single-use
+#     session-token rows). Strategy is Recreate so the RWO PVC can re-attach.
+#   * The browser calls the backend DIRECTLY, so the backend has its own Route.
+#     APP_API_BASE_URL (frontend) and CORS_ALLOWED_ORIGINS (backend) must point
+#     at these Route hostnames.
+#   * ENABLE_OTP_DIAGNOSTICS=true logs OTPs (mock SMS) — fine for SIT/UAT-with-mocks,
+#     MUST be "false" before any real production use.
+# =============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: onboarding-config
+  labels:
+    app.kubernetes.io/part-of: onboarding-portal
+data:
+  NODE_ENV: "production"
+  DOCKER: "true"
+  HOST: "0.0.0.0"
+  PORT: "3000"
+  DATABASE_URL: "file:./data/dev.db"
+  UPLOAD_DIR: "./uploads"
+  LOG_DIR: "./logs"
+  TRUST_PROXY: "true" # behind the OpenShift Route; lets the rate limiter see the real client IP
+  OTP_EXPIRY_SECONDS: "120"
+  OTP_MAX_FAILED_ATTEMPTS: "5"
+  VERIFIED_SESSION_TTL_SECONDS: "900"
+  CUSTOMER_REGISTRY_GATEWAY_MODE: "mock"
+  DUPLICATE_CHECK_GATEWAY_MODE: "mock"
+  OTP_GATEWAY_MODE: "mock"
+  DOCUMENT_STORAGE_GATEWAY_MODE: "mock"
+  SUBMISSION_EXPORT_GATEWAY_MODE: "mock"
+  JSON_BODY_LIMIT_MB: "1"
+  URLENCODED_BODY_LIMIT_MB: "1"
+  UPLOAD_MAX_FILE_SIZE_MB: "2"
+  SUBMISSION_RATE_LIMIT_WINDOW_MS: "60000"
+  SUBMISSION_RATE_LIMIT_MAX: "5"
+  ENABLE_OTP_DIAGNOSTICS: "true" # >>> set to "false" for real production
+  SEED_ON_START: "false"
+  # Browser-reachable URLs (the backend Route + frontend Route hostnames):
+  APP_API_BASE_URL: "https://onboarding-api.__APPS_DOMAIN__" # >>> REPLACE __APPS_DOMAIN__
+  CORS_ALLOWED_ORIGINS: "https://onboarding.__APPS_DOMAIN__" # >>> REPLACE __APPS_DOMAIN__
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: onboarding-secrets
+  labels:
+    app.kubernetes.io/part-of: onboarding-portal
+type: Opaque
+stringData:
+  # >>> REPLACE both with strong random values:  openssl rand -hex 32
+  OTP_HASH_SECRET: "CHANGE_ME_otp_hash_secret"
+  SESSION_TOKEN_SECRET: "CHANGE_ME_session_token_secret"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: onboarding-data
+  labels:
+    app.kubernetes.io/part-of: onboarding-portal
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: <your-default-sc>   # omit to use the cluster default
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: onboarding-uploads
+  labels:
+    app.kubernetes.io/part-of: onboarding-portal
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: onboarding-backend
+  labels:
+    app: onboarding-backend
+    app.kubernetes.io/part-of: onboarding-portal
+spec:
+  replicas: 1 # do NOT increase: SQLite single-writer + single-use session tokens
+  strategy:
+    type: Recreate # RWO PVC cannot attach to two pods during a rolling update
+  selector:
+    matchLabels:
+      app: onboarding-backend
+  template:
+    metadata:
+      labels:
+        app: onboarding-backend
+    spec:
+      containers:
+        - name: backend
+          # >>> REPLACE __NAMESPACE__ and __TAG__
+          image: image-registry.openshift-image-registry.svc:5000/__NAMESPACE__/onboarding-backend:__TAG__
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: onboarding-config
+            - secretRef:
+                name: onboarding-secrets
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 3000
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: data
+              mountPath: /app/backend/data
+            - name: uploads
+              mountPath: /app/backend/uploads
+            - name: logs
+              mountPath: /app/backend/logs
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: onboarding-data
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: onboarding-uploads
+        - name: logs
+          emptyDir: {} # OTP log is also written to stdout (oc logs); file log is ephemeral
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: onboarding-backend
+  labels:
+    app: onboarding-backend
+    app.kubernetes.io/part-of: onboarding-portal
+spec:
+  selector:
+    app: onboarding-backend
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: onboarding-api
+  labels:
+    app.kubernetes.io/part-of: onboarding-portal
+spec:
+  host: onboarding-api.__APPS_DOMAIN__ # >>> REPLACE __APPS_DOMAIN__
+  to:
+    kind: Service
+    name: onboarding-backend
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: onboarding-frontend
+  labels:
+    app: onboarding-frontend
+    app.kubernetes.io/part-of: onboarding-portal
+spec:
+  replicas: 1 # stateless; can be scaled if desired
+  selector:
+    matchLabels:
+      app: onboarding-frontend
+  template:
+    metadata:
+      labels:
+        app: onboarding-frontend
+    spec:
+      containers:
+        - name: frontend
+          # >>> REPLACE __NAMESPACE__ and __TAG__
+          image: image-registry.openshift-image-registry.svc:5000/__NAMESPACE__/onboarding-frontend:__TAG__
+          ports:
+            - containerPort: 8080
+          env:
+            - name: APP_API_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: onboarding-config
+                  key: APP_API_BASE_URL
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: onboarding-frontend
+  labels:
+    app: onboarding-frontend
+    app.kubernetes.io/part-of: onboarding-portal
+spec:
+  selector:
+    app: onboarding-frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: onboarding
+  labels:
+    app.kubernetes.io/part-of: onboarding-portal
+spec:
+  host: onboarding.__APPS_DOMAIN__ # >>> REPLACE __APPS_DOMAIN__
+  to:
+    kind: Service
+    name: onboarding-frontend
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
